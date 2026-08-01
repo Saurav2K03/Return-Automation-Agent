@@ -1,25 +1,22 @@
 # Return Automation Agent
 
-This project is a simple Python automation tool for handling return tasks from an Excel file. It is built to help process return requests in a more organized and repeatable way.
+This project is a Python-based automation tool for handling return tasks from an Excel file. It is designed to make return processing more structured, easier to track, and simpler to run from the command line.
 
-## What this project does
+## Overview
 
-- Reads return-related data from an Excel sheet
-- Organizes each row as a task
-- Tracks task status and return progress
-- Supports simple command-line options for running the script
-- Writes logs and stores screenshots when needed
+The script reads return-related data from an Excel sheet, prepares each row as a task, and provides a foundation for automating return actions. It also includes support for logging, status tracking, and basic command-line options.
+
+## What the project includes
+
+- A simple task model for each return request
+- A result model to track what happened after a task is processed
+- Excel column mapping for the input sheet
+- Logging support for debugging and monitoring
+- A command-line interface for running the script
 
 ## Current status
 
-The basic structure of the project is ready. The script includes:
-
-- task and result models
-- Excel file handling setup
-- logging support
-- a simple CLI interface
-
-The browser automation part is still being developed and improved.
+The project is still in an early stage. The basic structure and workflow are in place, while the browser automation part is being developed further.
 
 ## Requirements
 
@@ -50,11 +47,11 @@ python3 return_agent.py --order-id OD123456
 
 ## Project files
 
-- return_agent.py: main Python script
-- Faym Status Test Orders.xlsx: sample Excel input data
+- [return_agent.py](return_agent.py): main Python script
+- [Faym Status Test Orders.xlsx](Faym%20Status%20Test%20Orders.xlsx): sample Excel input file
 - logs/: folder for generated log files
 - screenshots/: folder for screenshots if needed
 
 ## Notes
 
-This is an early version of the project. The workflow is being built step by step, and more automation features will be added over time.
+This is a working foundation for the automation project. More features will be added as the workflow becomes more complete.

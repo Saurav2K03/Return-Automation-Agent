@@ -182,8 +182,195 @@ def setup_logging():
     Returns:
         logging.Logger: Configured logger instance named 'ReturnAgent'
     """
-    # TODO
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+    log_file = os.path.join(LOG_DIR, f"return_agent_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+
+    # Configure root logger with:
+    #   - INFO level: logs INFO, WARNING, ERROR, CRITICAL (not DEBUG)
+    #   - Format: timestamp [LEVEL] logger_name: message
+    #   - Two handlers: file (persistent) and stdout (real-time)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
     return logging.getLogger('ReturnAgent')
+
+
+# ------------------------
+# HUMAN BEHAVIOR SIMULATOR
+# ------------------------
+
+class HumanSimulator:
+    """
+    Simulates human-like behavior to avoid bot detection by e-commerce platforms.
+
+    E-commerce sites like Flipkart use sophisticated bot detection systems
+    (e.g., PerimeterX, Akamai Bot Manager, DataDome) that analyze:
+      - Click timing patterns (bots click at machine speed)
+      - Mouse movement trajectories (bots move in straight lines)
+      - Typing speed (bots paste entire strings instantly)
+      - Scroll behavior (bots jump directly to elements)
+      - Session patterns (bots don't pause to "think")
+    
+    This class implements five strategies to mimic human behavior:
+      1. Random delays between actions (1-3.5 seconds)
+      2. Character-by-character typing with variable speed
+      3. Natural scroll patterns (small increments, not instant jumps)
+      4. Random mouse movements to avoid straight-line patterns
+      5. Session-level rate limiting (longer pauses every N actions)
+    """
+    # TODO
+    pass
+
+
+# -------------
+# EXCEL MANAGER
+# -------------
+
+def _safe_float(value):
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return None
+    
+
+class ExcelManager:
+    """
+    Handles reading pending tasks from and writing results to the Excel file.
+    
+    Design decisions:
+    1. Uses openpyxl (not pandas) because openpyxl supports cell-level writes
+       without rewriting the entire sheet. Pandas would destroy formatting.
+    2. Opens and closes the workbook for each operation to prevent file
+       corruption if the agent crashes. This is slower but much safer.
+    3. Results are written immediately after each task completes, so partial
+       progress is preserved even if the agent crashes mid-execution.
+    """
+
+    def __init__(self, filepath, logger):
+        """
+        Args:
+        filepath: Absolute path to the Excel file
+        logger: Logger instance for recording read/write operations
+        """
+        self.filepath = filepath
+        self.logger = logger
+
+    def read_pending_tasks(self):
+        """
+        Read all rows with status 'Pending' from the excel file.
+        
+        Workflow:
+        1. Open the workbook in read mode
+        2. Iterate through all rows starting from row 2 (row 1 = headers)
+        3. Filter rows where the Status column (J) is "Pending"
+        4. Convert each matching row into a ReturnTask dataclass instance
+        5. Close the workbook and return the list of tasks
+        
+        Returns:
+            list[ReturnTask]: List of pending tasks to process
+        """
+        # Opent the workbook.
+        wb = openpyxl.load_workbook(self.filepath)
+        ws = wb.active      # Get's the first active sheet (we only have one sheet)
+        tasks = []
+
+        # Iterate through rows starting from row 2 (skip header row 1).
+        # enumerate(..., start=2) makes row_idx match the actual Excel row number,
+        # which we need later for writing results back to the correct row.
+        # values_only=False returns Cell objects (not just values) — we use this
+        # to access cell.value for each column.
+        for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=False), start=2):
+            # Extract the value from each cell in the row
+            values = [cell.value for cell in row]
+            # Skip rows with fewer than 11 columns (malformed/empty rows)
+            if len(values) < 11:
+                continue
+
+            # Check if this row's status is "Pending" (case-insensitive).
+            # str(values[9] or '') handles None values safely.
+            status = str(values[9] or '').strip()
+            if status.lower() != 'pending':
+                continue    # Skip non-pending tasks
+
+            # Create a ReturnTask instance from the row data.
+            # Each values[N] corresponds to a column (0-indexed):
+            #   0=Address, 1=Contact, 2=Product Link, 3=Amount, etc.
+            # str(values[N] or '') safely converts None to empty string.
+            # float(values[N] or 0) safely converts None to 0.0.
+            task = ReturnTask(
+                row_number=row_idx,                                       # Excel row for write-back
+                address=str(values[0] or ''),                             # Column A
+                contact=str(values[1] or ''),                             # Column B
+                product_link=str(values[2] or ''),                        # Column C
+                amount=float(values[3] or 0),                             # Column D (₹)
+                num_products=int(values[4] or 0),                         # Column E
+                order_date=str(values[5] or ''),                          # Column F
+                order_id=str(values[6] or ''),                            # Column G
+                delivery_date=str(values[7] or ''),                       # Column H
+                return_window=str(values[8] or ''),                       # Column I
+                status=status,                                            # Column J
+                platform=str(values[10] or ''),                           # Column K
+                refund_id=str(values[11] or '') if len(values) > 11 else None,      # Column L
+                return_status=str(values[12] or '') if len(values) > 12 else None,  # Column M
+                refund_amount=_safe_float(values[13]) if len(values) > 13 else None, # Column N
+                timestamp=str(values[14] or '') if len(values) > 14 else None,      # Column O
+                log=str(values[15] or '') if len(values) > 15 else None,            # Column P
+            )
+            tasks.append(task)
+
+        wb.close()  # Always close to release the file handle
+        self.logger.info(f"Found {len(tasks)} pending tasks in Excel")
+        return tasks
+
+    def write_result(self, task: ReturnTask, result: ReturnResult):
+        """
+        Write the return result back to Excel for a specific line item.
+        
+        This method implements the "per-line-item write-back" requirement:
+        each SKU/product gets its own result, not just the order as a whole.
+        
+        The method opens the workbook, writes to the specific row, saves,
+        and closes. This per-operation I/O pattern is intentional:
+          - If the agent crashes after processing 3 of 7 tasks, the first 3
+            results are safely persisted in the file.
+          - A batch approach (write all at end) would lose ALL results on crash.
+        
+        Args:
+            task: The original task (contains row_number for write-back)
+            result: The processing result to write
+        """
+        # Open the workbook fresh for each write (not cached — safer)
+        wb = openpyxl.load_workbook(self.filepath)
+        ws = wb.active
+        row = task.row_number  # The exact excel row to update
+
+        # Write result columns (L through P):
+        ws.cell(row=row, column=12, value=result.return_id or '')         # Column L: Refund ID
+        ws.cell(row=row, column=13, value=result.return_status)           # Column M: Return Status
+        ws.cell(row=row, column=14, value=result.refund_amount)           # Column N: Refund Amount
+        ws.cell(row=row, column=15,                                       # Column O: Timestamp
+                value=datetime.now().isoformat())  # ISO 8601 format for consistency
+        ws.cell(row=row, column=16, value=result.log_message)             # Column P: Log/Error
+
+        # Update the Status column (J) based on the outcome:
+        if result.success:
+            ws.cell(row=row, column=10, value='Done')        # Task completed successfully
+        elif 'human review' in result.return_status.lower():
+            ws.cell(row=row, column=10, value='Needs Review') # Needs manual intervention
+
+        # Save and close. This persists the changes to disk immediately.
+        wb.save(self.filepath)
+        wb.close()
+        self.logger.info(f"Row {row}: Written result — Status: {result.return_status}, "
+                         f"Refund ID: {result.return_id}")
 
 
 # –––––––––––––––––––––––
@@ -291,21 +478,141 @@ class ReturnAgent:
         self._print_summary()
 
     def _process_flipkart_tasks(self, tasks):
+        """
+        Process all Flipkart return tasks in a single browser session.
+        
+        In dry-run mode, simulates processing without opening a browser.
+        In live mode: starts browser -> logs in -> processes each task -> closes.
+        
+        The try/finally pattern ensures the browser is ALWAYS closed,
+        even if the agent crashes during task processing.
+        
+        Args:
+            tasks: list of ReturnTask instances for Flipkart orders
+        """
+        if self.dry_run:
+            self.logger.info("Dry run mode - simulating Flipkart returns")
+            for task in tasks:
+                self._dry_run_task(task)
+            return
+
+        # Initialize browser and helper objects
+        browser = BrowserController(self.logger, headless=self.headless)
+        driver = browser.start()
+        human = HumanSimulator(self.logger)
+        handler = FlipkartHandler(driver, human, self.logger)
+
+        try:
+            # Authenticate with Flipkart
+            login_success = handler.login(FLIPKART_PHONE)
+            if not login_success:
+                # If login fails after all retries, flag ALL tasks and abort.
+                self.logger.error("Could not login to Flipkart. Flagging all tasks.")
+                for task in tasks:
+                    result = ReturnResult(
+                        success=False,
+                        return_status="Login failed",
+                        log_message="Could not login to Flipkart"
+                    )
+                    self._record_result(task, result)
+                return
+
+            # Process each task INDEPENDENTLY - this is the partial-success handling.
+            for i, task in enumerate(tasks):
+                self.logger.info(f"\n--- Task {i + 1}/{len(tasks)} ---")
+                self.logger.info(f"Order: {task.order_id} | Amount: ₹{task.amount}")
+
+                # Pre-check: some tasks already have a status from previous runs.
+                if task.return_status and task.return_status.lower() not in ['', 'none', 'pending']:
+                    if 'cancelled' in task.return_status.lower():
+                        result = ReturnResult(
+                            success=True,
+                            return_id=task.refund_id,
+                            return_status="Already Cancelled & Refunded",
+                            refund_amount=task.refund_amount,
+                            log_message=f"Skipped: {task.return_status}"
+                        )
+                    elif 'not yet delivered' in task.return_status.lower():
+                        result = ReturnResult(
+                            success=False,
+                            return_status="Not yet delivered",
+                            log_message="Order not yet delivered"
+                        )
+                    elif 'support' in task.return_status.lower():
+                        result = ReturnResult(
+                            success=False,
+                            return_status="Support Needed",
+                            log_message=task.log or "Manual support needed"
+                        )
+                    else:
+                        # Unknown status - try the return flow
+                        result = handler.initiate_return(task)
+                else:
+                    # No pre-existing status - initiate the full return flow
+                    result = handler.initiate_return(task)
+
+                # Write result to excel immediately (crash-safe)
+                self._record_result(task, result)
+                # Pause between tasks to avoid rate limiting
+                human.random_delay(2, 5)
+
+        except Exception as e:
+            self.logger.error(f"Critical error: {str(e)}")
+        finally:
+            # ALWAYS close the browser, even if an exception occured.
+            browser.stop()
+
+    def _dry_run_task(self, task: ReturnTask):
         # TODO
         pass
 
     def _record_result(self):
-        # TODO
-        pass
+        """
+        Record a result and write it to excel (unless in dry-run mode).
+        
+        This is the single point where results are persisted. Having one
+        method for this ensures consistent behavior across all code paths.
+        
+        Args:
+            task: The original task
+            results: The processing result
+        """
+        self.results_summary.append((task, result))
+
+        if not self.dry_run:
+            try:
+                self.excel_manager.write_result(task, result)
+            except Exception as e:
+                self.logger.error(f"Failed to write result to excel: {e}")
     
     def _print_summary(self):
-        # TODO
-        pass
+        """
+        Print a formatted summary of all processed tasks.
+        
+        Shows total/successful/failed counts and individual task outcomes.
+        Uses emoji icons (✅,❌) for quick visual scanning."""
+        self.logger.info("\n" + "=" * 60)
+        self.logger.info("RETURN AUTOMATION - SUMMARY")
+        self.logger.info("=" * 60)
 
+        total = len(self.results_summary)
+        successful = sum(1 for _, r in self.results_summary if r.success)
+        failed = sum(1 for _, r in self.results_summary if not r.success)
 
-class ExcelManager:
-    # TODO
-    pass
+        self.logger.info(f"Total tasks processed: {total}")
+        self.logger.info(f"Successful: {successful}")
+        self.logger.info(f"Failed/Needs Review: {failed}")
+        self.logger.info("")
+
+        # Print each task result with status icon and details
+        for task, result in self.results_summary:
+            status_icon = "✅" if result.success else "❌"
+            self.logger.info(f"  {status_icon} Order {task.order_id} | "
+                             f"₹{task.amount} | {result.return_status}")
+            if result.log_message:
+                self.logger.info(f"     └─ {result.log_message}")
+
+        self.logger.info("=" * 60)
 
 
 # –––––––––––––––
