@@ -224,8 +224,125 @@ class HumanSimulator:
       4. Random mouse movements to avoid straight-line patterns
       5. Session-level rate limiting (longer pauses every N actions)
     """
-    # TODO
-    pass
+    def __init__(self, logger):
+        """
+        Initialize the human simulator.
+        
+        Args:
+            logger: Logger instance for recording delay decisions
+        """
+        self.logger = logger
+        # Track total actions to implement rate limiting.
+        # Every 5 actions, we take a longer pause.
+        self.action_count = 0
+
+    def random_delay(self, min_sec=None, max_sec=None):
+        """
+        Wait a random duration to simulate human thinking/reading time.
+        
+        This is the most important anti-detection measure. Real humans don't
+        click buttons the instant they appear — they read, think, and then act.
+        
+        Args:
+            min_sec: Minimum wait time (defaults to MIN_ACTION_DELAY = 1.0s)
+            max_sec: Maximum wait time (defaults to MAX_ACTION_DELAY = 3.5s)
+        """
+        min_sec = min_sec or MIN_ACTION_DELAY
+        max_sec = max_sec or MAX_ACTION_DELAY
+        # random.uniform gives a float uniformly distributed between min and max.
+        # This is better than random.randint (which only gives integers) because
+        # human timing is continuous, not discrete.
+        delay = random.uniform(min_sec, max_sec)
+        self.logger.debug(f"Human delay: {delay:.2f}s")
+        time.sleep(delay)
+
+    def type_like_human(self, element, text):
+        """
+        Type text character by character with random delays between keystrokes.
+        
+        Bots typically use element.send_keys("entire string") which pastes
+        the text instantly. Real humans type one character at a time with
+        variable speed — faster for common sequences, slower for unusual ones.
+        
+        Args:
+            element: Selenium WebElement (input field) to type into
+            text: The string to type
+        """
+        for char in text:
+            element.send_keys(char)  # Send one character at a time
+            # Variable delay between characters simulates realistic typing speed
+            time.sleep(random.uniform(MIN_TYPING_DELAY, MAX_TYPING_DELAY))
+        # Small pause after finishing typing (human would review what they typed)
+        self.random_delay(0.5, 1.0)
+
+    def scroll_naturally(self, driver, pixels=None):
+        """
+        Scroll the page in a natural, human-like manner.
+        
+        Bots use scrollIntoView() which instantly jumps to an element.
+        Humans scroll smoothly in multiple small increments.
+        
+        Args:
+            driver: Selenium WebDriver instance
+            pixels: Total pixels to scroll (random 200-500 if not specified)
+        """
+        if pixels is None:
+            pixels = random.randint(200, 500)
+        # Break the scroll into 3-7 small steps
+        steps = random.randint(3, 7)
+        step_size = pixels // steps
+        for _ in range(steps):
+            # Execute JavaScript to scroll by step_size pixels
+            driver.execute_script(f"window.scrollBy(0, {step_size});")
+            # Tiny delay between scroll steps for smooth animation
+            time.sleep(random.uniform(0.05, 0.15))
+        # Pause after scrolling (human would read the newly visible content)
+        self.random_delay(0.5, 1.0)
+
+    def random_mouse_movement(self, driver):
+        """
+        Move the mouse cursor to a random position on the page.
+        
+        Bot detection systems track mouse movement patterns. Real humans move
+        their mouse around while reading. This method creates random cursor
+        movement to make the session appear more natural.
+        
+        Note: This is wrapped in try/except because ActionChains may not work
+        in all browser configurations (e.g., headless mode). It's a nice-to-have
+        enhancement, not a critical feature.
+        
+        Args:
+            driver: Selenium WebDriver instance
+        """
+        try:
+            from selenium.webdriver.common.action_chains import ActionChains
+            # Find the body element as a reference point for cursor positioning
+            body = driver.find_element("tag name", "body")
+            # Get viewport dimensions to stay within visible area
+            viewport_width = driver.execute_script("return window.innerWidth;")
+            viewport_height = driver.execute_script("return window.innerHeight;")
+            # Generate random coordinates (avoiding edges where there are no elements)
+            x = random.randint(100, max(101, viewport_width - 100))
+            y = random.randint(100, max(101, viewport_height - 100))
+            # Move cursor to the random position relative to the body element
+            ActionChains(driver).move_to_element_with_offset(body, x, y).perform()
+        except Exception:
+            pass  # Non-critical; some environments don't support mouse simulation
+
+    def increment_action(self):
+        """
+        Track action count and apply rate limiting.
+        
+        Every 5 actions, the agent takes a longer pause (3-6 seconds).
+        This mimics a human who periodically pauses to think, read, or
+        take a sip of coffee. Without this, even with random delays,
+        the consistent action cadence could look suspicious.
+        """
+        self.action_count += 1
+        if self.action_count % 5 == 0:
+            # Every 5 actions, take a longer "thinking" break
+            self.logger.info(f"Rate limiting pause (action #{self.action_count})")
+            self.random_delay(3.0, 6.0)
 
 
 # -------------
@@ -371,6 +488,695 @@ class ExcelManager:
         wb.close()
         self.logger.info(f"Row {row}: Written result — Status: {result.return_status}, "
                          f"Refund ID: {result.return_id}")
+
+
+# -----------------------
+# FLIPKART RETURN HANDLER
+# -----------------------
+
+class FlipkartHandler:
+    """
+    Handles the complete Flipkart return flow using Selenium WebDriver.
+    
+    This class encapsulates all Flipkart-specific logic:
+      - Login via phone number + OTP
+      - Order navigation and lookup
+      - Return initiation (reason selection, refund method, confirmation)
+      - Return ID and refund amount extraction
+      - Screenshot capture for debugging
+    
+    The class is designed to be replaceable — if Amazon support is needed,
+    an AmazonHandler class would implement the same interface (navigate_to_order,
+    initiate_return) but with Amazon-specific UI interactions.
+    
+    Flipkart Return Flow (typical):
+      1. Go to My Orders page
+      2. Find the specific order by ID
+      3. Click "Return" button on the item
+      4. Select a return reason (radio button)
+      5. Optionally add a comment
+      6. Click Continue/Next
+      7. Select refund method (original payment / bank account)
+      8. Select pickup option (scheduled pickup / self ship)
+      9. Click Confirm
+      10. Capture the Return ID from the confirmation page
+    """
+
+    def __init__(self, driver, human_sim, logger):
+        """
+        Args:
+            driver: Selenium WebDriver instance (Chrome)
+            human_sim: HumanSimulator instance for anti-detection delays
+            logger: Logger for recording actions and errors
+        """
+        self.driver = driver
+        self.human = human_sim
+        self.logger = logger
+
+    def login(self, phone_number, max_retries=MAX_RETRIES):
+        """
+        Login to Flipkart using phone number + OTP authentication.
+        
+        Flipkart's login flow:
+          1. Navigate to login page
+          2. Enter phone number in the input field
+          3. Click "Request OTP" button
+          4. Wait for OTP to be entered (manually, by calling 9205359199)
+          5. Verify login success by checking if URL changed away from /login
+        
+        OTP handling: In this implementation, OTP must be entered manually.
+        A production version would integrate with an SMS gateway API to
+        automatically retrieve and enter the OTP.
+        
+        Args:
+            phone_number: The phone number to log in with
+            max_retries: Number of login attempts before giving up
+            
+        Returns:
+            bool: True if login succeeded, False if all attempts failed
+        """
+        for attempt in range(max_retries):
+            try:
+                self.logger.info(f"Flipkart login attempt {attempt + 1}/{max_retries}")
+                # Navigate to the login page
+                self.driver.get(FLIPKART_LOGIN_URL)
+                self.human.random_delay(2, 4)  # Wait for page to fully render
+
+                # Flipkart sometimes shows a login popup that blocks interaction.
+                # Try to close it if it appears.
+                try:
+                    from selenium.webdriver.common.by import By
+                    from selenium.webdriver.support.ui import WebDriverWait
+                    from selenium.webdriver.support import expected_conditions as EC
+
+                    # Look for the popup dismiss button (class names may change)
+                    close_btn = WebDriverWait(self.driver, 5).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR,
+                                                    "button._2KpZ6l._2doB4z"))
+                    )
+                    close_btn.click()
+                    self.human.random_delay()
+                except Exception:
+                    pass  # No popup appeared — continue normally
+
+                # Navigate to login page again (after closing popup)
+                self.driver.get(FLIPKART_LOGIN_URL)
+                self.human.random_delay(2, 4)
+
+                # Import Selenium utilities for element location and waiting.
+                # These are imported inside the method because they're only needed
+                # when actually running the browser (not in dry-run mode).
+                from selenium.webdriver.common.by import By
+                from selenium.webdriver.support.ui import WebDriverWait
+                from selenium.webdriver.support import expected_conditions as EC
+
+                # The input field doesn't have a placeholder attribute directly.
+                # Instead, it's followed by a label/span containing the text "Enter Email/Mobile number".
+                # We use XPath to find an input that has a sibling label or span containing "Email" or "Mobile",
+                # or fallback to the first text input inside a form.
+                phone_input = WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.XPATH,
+                        "//form[.//button[contains(., 'OTP') or contains(., 'Continue') or contains(., 'CONTINUE') or contains(., 'LOGIN')]]//input[@type='text']"
+                    ))
+                )
+                phone_input.clear()  # Clear any pre-filled value
+                # Type the phone number character by character (anti-bot measure)
+                self.human.type_like_human(phone_input, phone_number)
+                self.human.random_delay()
+
+                # Find and click the "Request OTP" / "Continue" / "LOGIN" button.
+                # Using XPath with contains() makes this robust against text variations.
+                # The | (pipe) in XPath means OR — matches any of the listed text values.
+                continue_btn = self.driver.find_element(
+                    By.XPATH,
+                    "//button[contains(text(), 'Request OTP') or "
+                    "contains(text(), 'CONTINUE') or "
+                    "contains(text(), 'Continue') or "
+                    "contains(text(), 'LOGIN')]"
+                )
+                continue_btn.click()
+                self.human.random_delay(2, 3)
+
+                # Wait for the OTP input field to appear
+                self.logger.info("⏳ Waiting for OTP entry... "
+                                 "Please enter OTP manually or call 9205359199 to get it.")
+
+                # Wait up to 120 seconds for the OTP input field to appear.
+                # The CSS selector matches various OTP input styles:
+                #   - maxlength attribute (OTP fields often limit to 4-6 digits)
+                #   - type='number' (numeric-only input)
+                #   - class containing 'otp'
+                otp_input = WebDriverWait(self.driver, 120).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR,
+                        "input[type='text'][maxlength], input[type='number'], "
+                        "input[class*='otp']"))
+                )
+
+                self.logger.info("🔑 OTP input field found. Enter OTP manually...")
+
+                # Wait up to 180 seconds (3 minutes) for the user to enter OTP
+                # and the page to navigate away from the login URL.
+                # In production, this would be automated via SMS API integration.
+                WebDriverWait(self.driver, 180).until(
+                    lambda d: "login" not in d.current_url.lower()
+                )
+                self.human.random_delay(3, 5)
+
+                # Verify login was successful by checking if we're still on the login page.
+                # If the URL no longer contains "login", authentication succeeded.
+                if "login" not in self.driver.current_url.lower():
+                    self.logger.info("✅ Flipkart login successful!")
+                    return True
+
+            except Exception as e:
+                self.logger.error(f"Login attempt {attempt + 1} failed: {str(e)}")
+                # Wait longer between failed attempts (exponential-ish backoff)
+                self.human.random_delay(5, 10)
+
+        self.logger.error("All login attempts failed")
+        return False
+
+    def navigate_to_order(self, order_id):
+        """
+        Navigate to a specific order's details page on Flipkart.
+        
+        Strategy (tries multiple approaches):
+          1. Direct URL with order ID parameter
+          2. Search for the order on the orders page
+          3. Scroll through the orders page to find it
+        
+        Args:
+            order_id: Flipkart order ID (e.g., "OD337915012166989100")
+            
+        Returns:
+            bool: True if the order was found on the page, False otherwise
+        """
+        try:
+            from selenium.webdriver.common.by import By
+            from selenium.webdriver.support.ui import WebDriverWait
+            from selenium.webdriver.support import expected_conditions as EC
+
+            self.logger.info(f"Navigating to order: {order_id}")
+
+            # Approach 1: Go to My Orders page first
+            self.driver.get(FLIPKART_ORDERS_URL)
+            self.human.random_delay(2, 4)
+
+            # Approach 2: Try direct URL with order ID as a query parameter.
+            # This sometimes works on Flipkart to jump directly to the order.
+            order_url = f"https://www.flipkart.com/account/orders?orderItemId={order_id}"
+            self.driver.get(order_url)
+            self.human.random_delay(2, 4)
+
+            # Approach 3: Try the search functionality on the orders page.
+            # Not all Flipkart versions have this, so it's wrapped in try/except.
+            try:
+                # Use a specific placeholder text to avoid matching the global header search bar
+                search_input = self.driver.find_element(
+                    By.CSS_SELECTOR,
+                    "input[placeholder*='orders']"
+                )
+                search_input.clear()
+                self.human.type_like_human(search_input, order_id)
+                self.human.random_delay(2, 3)
+
+                # Use XPath to find the specific button for searching orders
+                search_btn = self.driver.find_element(
+                    By.XPATH,
+                    "//button[contains(., 'Search Orders')]"
+                )
+                search_btn.click()
+                self.human.random_delay(2, 4)
+            except Exception:
+                self.logger.debug("Search not available, scrolling to find order")
+
+            # Final check: look for the order ID text anywhere on the page.
+            # XPath //*[contains(text(), 'ORDER_ID')] finds any element containing
+            # the order ID string.
+            try:
+                order_element = WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.XPATH,
+                        f"//*[contains(text(), '{order_id}')]"))
+                )
+                self.human.scroll_naturally(self.driver)
+                self.logger.info(f"✅ Found order {order_id} on page")
+                return True
+            except Exception:
+                self.logger.warning(f"Order {order_id} not found on page")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"Error navigating to order {order_id}: {str(e)}")
+            return False
+
+    def initiate_return(self, task: ReturnTask) -> ReturnResult:
+        """
+        Initiate the return flow for a specific line item on Flipkart.
+        
+        This is the core automation method. It follows the Flipkart return flow:
+          1. Pre-check: skip if already cancelled/not delivered
+          2. Navigate to the order
+          3. Click the "Return" button
+          4. Select a return reason
+          5. Add an optional comment
+          6. Click Continue/Next
+          7. Select refund method
+          8. Select pickup option
+          9. Confirm the return
+          10. Capture the Return ID and refund amount from the confirmation
+        
+        PARTIAL-SUCCESS HANDLING:
+        Each step is wrapped in its own try/except. If selecting a reason fails,
+        the agent still tries to click Continue. If Continue fails, it still
+        tries to Confirm. This "best effort" approach maximizes the chance of
+        completing the return even if intermediate steps have UI changes.
+        
+        Args:
+            task: The return task containing order details
+            
+        Returns:
+            ReturnResult: The outcome of the return attempt
+        """
+        try:
+            from selenium.webdriver.common.by import By
+            from selenium.webdriver.support.ui import WebDriverWait
+            from selenium.webdriver.support import expected_conditions as EC
+
+            self.logger.info(f"Initiating return for Order {task.order_id}")
+            self.human.increment_action()  # Track for rate limiting
+
+            # --- PRE-CHECKS: Skip tasks that don't need browser interaction ---
+            
+            # Check 1: Already cancelled/refunded — no action needed
+            if task.return_status and 'cancelled' in task.return_status.lower():
+                return ReturnResult(
+                    success=True,
+                    return_id=task.refund_id,
+                    return_status="Already Cancelled & Refunded",
+                    refund_amount=task.refund_amount,
+                    log_message=f"Already cancelled. Refund ID: {task.refund_id}"
+                )
+
+            # Check 2: Not yet delivered — can't return what hasn't arrived
+            if task.return_status and 'not yet delivered' in task.return_status.lower():
+                return ReturnResult(
+                    success=False,
+                    return_status="Not yet delivered",
+                    log_message="Order is not yet delivered. Cannot initiate return."
+                )
+
+            # --- NAVIGATE TO ORDER ---
+            if not self.navigate_to_order(task.order_id):
+                return ReturnResult(
+                    success=False,
+                    return_status="Order Not Found",
+                    log_message=f"Could not find order {task.order_id} on Flipkart"
+                )
+
+            # --- STEP 1: Find and click "Return" button ---
+            # Multiple element types checked: <a>, <button>, <span>
+            # because Flipkart renders the return action differently depending
+            # on the order type and UI version.
+            try:
+                return_btn = WebDriverWait(self.driver, 10).until(
+                    EC.element_to_be_clickable((By.XPATH,
+                        "//a[contains(text(), 'Return')] | "
+                        "//button[contains(text(), 'Return')] | "
+                        "//span[contains(text(), 'Return')]"
+                    ))
+                )
+                self.human.random_delay()
+                return_btn.click()
+                self.human.random_delay(2, 4)
+            except Exception:
+                # No return button = likely out of return window or needs support
+                screenshot_path = self._take_screenshot(f"no_return_btn_{task.order_id}")
+                return ReturnResult(
+                    success=False,
+                    return_status="Support Needed",
+                    log_message="No return button found. May be out of return window "
+                                "or requires manual support.",
+                    screenshot_path=screenshot_path
+                )
+
+            # --- STEP 2: Select return reason ---
+            # Flipkart presents a list of reasons as radio buttons or labels.
+            # We try multiple common reason texts in priority order.
+            try:
+                reasons = [
+                    "Product quality issue",
+                    "Item not as described",
+                    "Wrong item received",
+                    "Product damaged",
+                    "Quality not as expected"
+                ]
+
+                # Try each reason text until one is found on the page
+                for reason_text in reasons:
+                    try:
+                        reason_elem = self.driver.find_element(
+                            By.XPATH,
+                            f"//span[contains(text(), '{reason_text}')] | "
+                            f"//label[contains(text(), '{reason_text}')]"
+                        )
+                        reason_elem.click()
+                        self.human.random_delay()
+                        break  # Found and clicked — stop trying other reasons
+                    except Exception:
+                        continue  # This reason text not found — try next one
+
+                # Fallback: if none of the specific reasons matched, try clicking
+                # the first radio button or reason div on the page
+                try:
+                    radio_btns = self.driver.find_elements(
+                        By.CSS_SELECTOR,
+                        "input[type='radio'], div[class*='reason']"
+                    )
+                    if radio_btns:
+                        radio_btns[0].click()
+                        self.human.random_delay()
+                except Exception:
+                    pass  # Reason selection is best-effort
+
+            except Exception as e:
+                self.logger.warning(f"Could not select return reason: {e}")
+
+            # --- STEP 3: Add optional comment ---
+            # Some return flows have a text area for additional comments.
+            # This is optional — the return can proceed without it.
+            try:
+                comment_box = self.driver.find_element(
+                    By.CSS_SELECTOR,
+                    "textarea, input[type='text'][placeholder*='comment']"
+                )
+                self.human.type_like_human(comment_box, "Product quality not as expected")
+                self.human.random_delay()
+            except Exception:
+                pass  # No comment box — that's fine
+
+            # --- STEP 4: Click Continue/Next/Submit ---
+            try:
+                next_btn = self.driver.find_element(
+                    By.XPATH,
+                    "//button[contains(text(), 'Continue')] | "
+                    "//button[contains(text(), 'CONTINUE')] | "
+                    "//button[contains(text(), 'Next')] | "
+                    "//button[contains(text(), 'Submit')]"
+                )
+                next_btn.click()
+                self.human.random_delay(2, 4)
+            except Exception:
+                pass  # Button might not exist in this flow variant
+
+            # --- STEP 5: Select refund method ---
+            # Options typically: "Original Payment Method" or "Bank Account"
+            try:
+                refund_options = self.driver.find_elements(
+                    By.XPATH,
+                    "//span[contains(text(), 'Original Payment')] | "
+                    "//span[contains(text(), 'Bank Account')] | "
+                    "//label[contains(text(), 'Refund')]"
+                )
+                if refund_options:
+                    refund_options[0].click()  # Select the first available option
+                    self.human.random_delay()
+            except Exception:
+                pass
+
+            # --- STEP 6: Select pickup option ---
+            # Options typically: "Schedule Pickup" or "Self Ship"
+            try:
+                pickup_options = self.driver.find_elements(
+                    By.XPATH,
+                    "//span[contains(text(), 'Schedule Pickup')] | "
+                    "//span[contains(text(), 'Self Ship')] | "
+                    "//label[contains(text(), 'pickup')]"
+                )
+                if pickup_options:
+                    pickup_options[0].click()  # Select the first available option
+                    self.human.random_delay()
+            except Exception:
+                pass
+
+            # --- STEP 7: Confirm the return ---
+            try:
+                confirm_btn = self.driver.find_element(
+                    By.XPATH,
+                    "//button[contains(text(), 'Confirm')] | "
+                    "//button[contains(text(), 'CONFIRM')] | "
+                    "//button[contains(text(), 'Submit Return')] | "
+                    "//button[contains(text(), 'SUBMIT')]"
+                )
+                confirm_btn.click()
+                self.human.random_delay(3, 5)  # Longer wait for confirmation processing
+            except Exception:
+                pass
+
+            # --- STEP 8: Capture return ID and refund amount ---
+            # After confirmation, the page should show return details.
+            # We extract the Return ID and refund amount using regex patterns.
+            return_id = None
+            refund_amount = None
+
+            try:
+                # Get all visible text on the page
+                page_text = self.driver.find_element(By.TAG_NAME, "body").text
+
+                # Extract Return/Refund ID using regex.
+                # Matches patterns like "Return ID: ABC123" or "Refund #XYZ789"
+                import re
+                return_id_match = re.search(
+                    r'(?:Return|Refund)\s*(?:ID|#|Number)[:\s]*([A-Z0-9]+)',
+                    page_text, re.IGNORECASE
+                )
+                if return_id_match:
+                    return_id = return_id_match.group(1)
+
+                # Extract refund amount.
+                # Matches patterns like "Refund: ₹1,234.56" or "Amount: 5678"
+                amount_match = re.search(
+                    r'(?:Refund|Amount)[:\s]*₹?\s*([\d,]+(?:\.\d{2})?)',
+                    page_text, re.IGNORECASE
+                )
+                if amount_match:
+                    refund_amount = float(amount_match.group(1).replace(',', ''))
+
+                # Check for success indicators in the page text.
+                # If any of these keywords appear, the return was likely successful.
+                if any(keyword in page_text.lower() for keyword in
+                       ['return initiated', 'return placed', 'successfully',
+                        'return request', 'pickup scheduled']):
+                    screenshot_path = self._take_screenshot(
+                        f"return_success_{task.order_id}")
+                    return ReturnResult(
+                        success=True,
+                        return_id=return_id,
+                        return_status="Return Placed",
+                        refund_amount=refund_amount or task.amount,
+                        log_message=f"Return successfully initiated for order {task.order_id}",
+                        screenshot_path=screenshot_path
+                    )
+
+            except Exception as e:
+                self.logger.warning(f"Could not capture return details: {e}")
+
+            # If we reached here without confirming success, flag for human review.
+            # This is the "fail open" approach — we don't mark it as done unless
+            # we're SURE it succeeded. Uncertain results get flagged for review.
+            screenshot_path = self._take_screenshot(f"review_needed_{task.order_id}")
+            return ReturnResult(
+                success=False,
+                return_id=return_id,
+                return_status="Needs human review",
+                refund_amount=refund_amount,
+                log_message=f"Return flow completed but could not verify success. "
+                            f"Screenshot saved for review.",
+                screenshot_path=screenshot_path
+            )
+
+        except Exception as e:
+            # Catch-all for unexpected errors. Take a screenshot for debugging
+            # and return a failure result with the error message.
+            self.logger.error(f"Error processing return for {task.order_id}: {str(e)}")
+            screenshot_path = self._take_screenshot(f"error_{task.order_id}")
+            return ReturnResult(
+                success=False,
+                return_status="Failed",
+                log_message=f"Error: {str(e)}",
+                screenshot_path=screenshot_path
+            )
+
+    def _take_screenshot(self, name):
+        """
+        Capture a browser screenshot for debugging and review.
+        
+        Screenshots are saved with a descriptive name and timestamp:
+          screenshots/no_return_btn_OD123_20260730_235357.png
+        
+        This provides visual evidence of what the page looked like when
+        the agent encountered an issue — invaluable for debugging.
+        
+        Args:
+            name: Descriptive prefix for the screenshot filename
+            
+        Returns:
+            str or None: Path to the saved screenshot, or None if saving failed
+        """
+        try:
+            os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
+            path = os.path.join(SCREENSHOTS_DIR,
+                                f"{name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+            self.driver.save_screenshot(path)
+            self.logger.info(f"📸 Screenshot saved: {path}")
+            return path
+        except Exception as e:
+            self.logger.warning(f"Could not save screenshot: {e}")
+            return None
+
+
+# ------------------
+# BROWSER CONTROLLER
+# ------------------
+class BrowserController:
+    """
+    Manages the Chrome browser instance with stealth/anti-detection features.
+    
+    This class handles browser lifecycle (start/stop) and applies stealth
+    configurations to avoid bot detection. It tries two approaches:
+    
+    1. PREFERRED: undetected-chromedriver (pip install undetected-chromedriver)
+       - A modified ChromeDriver that patches common bot-detection fingerprints
+       - Automatically handles ChromeDriver version matching
+       - Bypasses most PerimeterX/Akamai/DataDome checks
+    
+    2. FALLBACK: Standard Selenium with manual stealth patches
+       - Applied when undetected-chromedriver is not installed
+       - Overrides navigator.webdriver JavaScript property
+       - Hides automation indicators (extension flags, empty plugins)
+       - Less reliable than undetected-chromedriver but still effective
+    """
+
+    def __init__(self, logger, headless=False):
+        """
+        Args:
+            logger: Logger instance for recording browser events
+            headless: If True, run browser without visible GUI window
+                      (useful for server environments, but less stealthy)
+        """
+        self.logger = logger
+        self.headless = headless
+        self.driver = None
+
+    def start(self):
+        """
+        Initialize the browser with stealth settings.
+        
+        Returns:
+            WebDriver: The configured Selenium WebDriver instance
+        """
+        try:
+            # --- Attempt 1: Use undetected-chromedriver ---
+            # This is a drop-in replacement for selenium.webdriver.Chrome
+            # that automatically patches Chrome to avoid bot detection.
+            import undetected_chromedriver as uc
+            options = uc.ChromeOptions()
+            if self.headless:
+                # '--headless=new' uses Chrome's new headless mode (v2),
+                # which is harder for sites to detect than the old headless mode.
+                options.add_argument('--headless=new')
+            # Set a realistic viewport size (1920x1080 = standard Full HD).
+            # Unusual sizes (like 800x600) can trigger bot detection.
+            options.add_argument('--window-size=1920,1080')
+            # Disable the "AutomationControlled" Blink feature flag.
+            # This flag is the primary way Chrome exposes automation to websites.
+            options.add_argument('--disable-blink-features=AutomationControlled')
+            # Set language to English (US) for consistent page content
+            options.add_argument('--lang=en-US,en')
+
+            self.driver = uc.Chrome(options=options)
+            self.logger.info("✅ Browser started (undetected-chromedriver — stealth mode)")
+
+        except ImportError:
+            # --- Attempt 2: Fall back to standard Selenium ---
+            # If undetected-chromedriver is not installed, use regular Selenium
+            # with manual stealth patches applied via Chrome DevTools Protocol (CDP).
+            from selenium import webdriver
+            from selenium.webdriver.chrome.options import Options
+            from selenium.webdriver.chrome.service import Service
+
+            options = Options()
+            if self.headless:
+                options.add_argument('--headless=new')
+            options.add_argument('--window-size=1920,1080')
+            options.add_argument('--disable-blink-features=AutomationControlled')
+            # '--no-sandbox': Required in some Linux environments (Docker, CI).
+            # Disables Chrome's sandbox security (safe for non-production use).
+            options.add_argument('--no-sandbox')
+            # '--disable-dev-shm-usage': Prevents Chrome from running out of
+            # shared memory in containers with limited /dev/shm.
+            options.add_argument('--disable-dev-shm-usage')
+            options.add_argument('--lang=en-US,en')
+
+            # Remove the "Chrome is being controlled by automated test software" infobar.
+            # excludeSwitches: removes command-line switches that expose automation.
+            # useAutomationExtension: disables the automation extension entirely.
+            options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            options.add_experimental_option("useAutomationExtension", False)
+
+            self.driver = webdriver.Chrome(options=options)
+
+            # --- Apply JavaScript stealth patches via Chrome DevTools Protocol ---
+            # These scripts run BEFORE any page's JavaScript, overriding browser
+            # properties that bot detectors check.
+            self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+                "source": """
+                    // Override navigator.webdriver: The #1 bot detection signal.
+                    // In automated Chrome, navigator.webdriver is true.
+                    // In normal Chrome, it's undefined.
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined
+                    });
+                    
+                    // Override navigator.plugins: Normal browsers have plugins
+                    // (PDF viewer, etc.). Automated browsers often have 0 plugins.
+                    // We fake a list of 5 plugins to appear legitimate.
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: () => [1, 2, 3, 4, 5]
+                    });
+                    
+                    // Override navigator.languages: Set realistic language prefs.
+                    // Some bots forget to set this, leaving it empty.
+                    Object.defineProperty(navigator, 'languages', {
+                        get: () => ['en-US', 'en']
+                    });
+                    
+                    // Add window.chrome.runtime: Present in real Chrome but
+                    // missing in some automated configurations.
+                    window.chrome = { runtime: {} };
+                """
+            })
+
+            self.logger.info("Browser started (standard Selenium with stealth patches)")
+
+        # Set implicit wait: if an element isn't found immediately, Selenium
+        # will retry for up to PAGE_LOAD_TIMEOUT seconds before raising an error.
+        self.driver.implicitly_wait(PAGE_LOAD_TIMEOUT)
+        return self.driver
+
+    def stop(self):
+        """
+        Close the browser cleanly, releasing all resources.
+        
+        This is called in a `finally` block to ensure the browser closes
+        even if the agent crashes. Unclosed Chrome processes consume memory
+        and can cause issues on subsequent runs.
+        """
+        if self.driver:
+            try:
+                self.driver.quit()  # quit() closes the browser AND kills the driver process
+                self.logger.info("Browser closed")
+            except Exception as e:
+                self.logger.warning(f"Error closing browser: {e}")
 
 
 # –––––––––––––––––––––––
@@ -563,10 +1369,67 @@ class ReturnAgent:
             browser.stop()
 
     def _dry_run_task(self, task: ReturnTask):
-        # TODO
-        pass
+        """
+        Simulate processing a task without any browser interaction.
+        
+        This is used in --dry-run mode to test:
+          - Excel reading logic
+          - Task routing logic (cancelled → skip, not delivered → skip, etc.)
+          - Result classification
+          - Summary generation
+        
+        No files are modified, no browser is opened.
+        
+        Args:
+            task: The task to simulate
+        """
+        self.logger.info(f"[DRY RUN] Order: {task.order_id} | "
+                         f"Amount: ₹{task.amount} | "
+                         f"Platform: {task.platform} | "
+                         f"Current Status: {task.return_status}")
 
-    def _record_result(self):
+        # Route the task based on its pre-existing status
+        if task.return_status:
+            status = task.return_status.lower()
+            if 'cancelled' in status:
+                result = ReturnResult(
+                    success=True,
+                    return_id=task.refund_id,
+                    return_status="Already Cancelled & Refunded",
+                    refund_amount=task.refund_amount,
+                    log_message=f"[DRY RUN] Skipped — already cancelled"
+                )
+            elif 'not yet delivered' in status:
+                result = ReturnResult(
+                    success=False,
+                    return_status="Not yet delivered",
+                    log_message="[DRY RUN] Cannot return — not yet delivered"
+                )
+            elif 'support' in status:
+                result = ReturnResult(
+                    success=False,
+                    return_status="Support Needed",
+                    log_message=f"[DRY RUN] Needs manual support: {task.log}"
+                )
+            else:
+                result = ReturnResult(
+                    success=False,
+                    return_status="Simulated — Would initiate return",
+                    log_message=f"[DRY RUN] Would navigate to Flipkart and initiate return"
+                )
+        else:
+            result = ReturnResult(
+                success=False,
+                return_status="Simulated — Would initiate return",
+                log_message=f"[DRY RUN] Would navigate to Flipkart and initiate return "
+                            f"for order {task.order_id}"
+            )
+
+        # Add to summary (but don't write to Excel in dry-run mode)
+        self.results_summary.append((task, result))
+        self.logger.info(f"  → Result: {result.return_status}")
+
+    def _record_result(self, task: ReturnTask, result: ReturnResult):
         """
         Record a result and write it to excel (unless in dry-run mode).
         

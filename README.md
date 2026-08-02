@@ -1,44 +1,54 @@
 # Return Automation Agent
 
-This project is a Python-based automation tool for handling return tasks from an Excel file. It is designed to make return processing more structured, easier to track, and simpler to run from the command line.
+This project is a Python-based automation tool for processing return tasks from an Excel file. It is designed to make return handling more structured, easier to track, and simple to run from the command line.
 
-## Overview
+## What this project does
 
-The script reads return-related data from an Excel sheet, prepares each row as a task, and provides a foundation for automating return actions. It also includes support for logging, status tracking, and basic command-line options.
+The script reads pending return tasks from an Excel sheet, creates task objects for each row, and prepares the workflow for browser-based return automation. It also supports:
 
-## What the project includes
-
-- A simple task model for each return request
-- A result model to track what happened after a task is processed
-- Excel column mapping for the input sheet
-- Logging support for debugging and monitoring
-- A command-line interface for running the script
+- reading and writing results back to Excel
+- logging activity during execution
+- saving screenshots when the flow hits an issue
+- running in dry-run mode for testing without opening a browser
 
 ## Current status
 
-The project is still in an early stage. The basic structure and workflow are in place, while the browser automation part is being developed further.
+The project is now in a working prototype stage. The core structure, Excel handling, logging, and browser automation flow are in place.
 
-## Requirements
+During testing, the login and order-search flow were verified, but the final return action could not be fully verified because the assessment account could not complete the required pickup flow and respond to the OTP request.
 
-This project uses Python and the following package:
+## Setup
 
-- openpyxl
-
-Install it with:
+1. Create a virtual environment
 
 ```bash
-pip install openpyxl
+python3 -m venv .venv
+source .venv/bin/activate
 ```
 
-## How to run
+2. Install the required packages
 
-Run the script in dry-run mode to test the flow without opening a browser:
+```bash
+pip install -r requirements.txt
+```
+
+3. Make sure Google Chrome or Chromium is installed on your machine.
+
+## Run the script
+
+Run in dry-run mode to test the flow without opening a browser:
 
 ```bash
 python3 return_agent.py --dry-run
 ```
 
-Other useful options:
+Run normally:
+
+```bash
+python3 return_agent.py
+```
+
+Useful options:
 
 ```bash
 python3 return_agent.py --headless
@@ -47,11 +57,22 @@ python3 return_agent.py --order-id OD123456
 
 ## Project files
 
-- [return_agent.py](return_agent.py): main Python script
-- [Faym Status Test Orders.xlsx](Faym%20Status%20Test%20Orders.xlsx): sample Excel input file
-- logs/: folder for generated log files
-- screenshots/: folder for screenshots if needed
+- return_agent.py: main Python script
+- sql_questions.py: answers to the assignment questions
+- Faym Status Test Orders.xlsx: sample Excel file used as input
+- README.md: project overview and usage instructions
+- requirements.txt: Python dependencies
+- logs/: folder for log files
+- screenshots/: folder for screenshots generated during execution
+
+## Dependencies
+
+The project uses:
+
+- openpyxl
+- selenium
+- undetected-chromedriver
 
 ## Notes
 
-This is a working foundation for the automation project. More features will be added as the workflow becomes more complete.
+This is a strong starting point for the project. The workflow can be improved further with better browser handling, more reliable return-step detection, and additional testing.
